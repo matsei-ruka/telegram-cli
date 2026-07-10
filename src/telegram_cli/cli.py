@@ -1420,7 +1420,7 @@ def bots_create_batch(
     skip_photo: Annotated[bool, typer.Option("--skip-photo")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
 ) -> None:
-    """Create bots from a botfather_*.csv (e.g. first-10 batch)."""
+    """Create bots from a CSV (columns: botfather_newbot_name, botfather_username, …)."""
     import csv
 
     async def _batch() -> None:
@@ -1446,19 +1446,26 @@ def bots_create_batch(
                 if photo_raw and not skip_photo:
                     p = Path(photo_raw)
                     if not p.is_file():
+                        # Resolve relative paths and common local layouts
                         slug = row.get("bundle_slug") or ""
-                        for cand in [
-                            Path("first-10-20260709")
-                            / slug
-                            / "profile_photo"
-                            / "selected.jpg",
-                            Path(
-                                photo_raw.replace(
-                                    "/home/jc/dav/dedalus-prime/agent-batches/",
-                                    "",
-                                )
-                            ),
-                        ]:
+                        candidates = [
+                            Path(photo_raw),
+                            Path.cwd() / photo_raw,
+                        ]
+                        if slug:
+                            candidates.extend(
+                                [
+                                    Path(slug) / "profile_photo" / "selected.jpg",
+                                    Path("profile_photo") / "selected.jpg",
+                                ]
+                            )
+                        # If CSV has an absolute path, also try basename under cwd
+                        if p.name:
+                            candidates.append(Path.cwd() / p.name)
+                            candidates.append(
+                                Path.cwd() / "profile_photo" / p.name
+                            )
+                        for cand in candidates:
                             if cand.is_file():
                                 p = cand
                                 break

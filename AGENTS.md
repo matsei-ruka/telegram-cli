@@ -45,7 +45,7 @@ telegram-cli/
 ├── sessions/                 # LOCAL ONLY — Telethon *.session files
 ├── bots/                     # LOCAL ONLY — saved bot tokens (*.json / *.env)
 ├── downloads/                # LOCAL ONLY — media downloads
-└── first-10-*/               # Optional local agent batches (not shipped; gitignored)
+└── (local only)              # agent batches / private assets — gitignored
 ```
 
 ### Module responsibilities
@@ -155,7 +155,7 @@ Almost every command accepts a **peer** string:
 6. Resolve entity, optionally `set_bot_photo` / `set_bot_info`
 7. Persist `bots/<username>.json` and `.env`
 
-Batch mode: `tg bots create-batch path/to.csv [--only N]` expects columns like `botfather_newbot_name`, `botfather_username`, `botpic_path`, `botfather_about_text`, `botfather_description`, `order`, `bundle_slug`. Local photo paths are remapped when CSV still points at remote absolute paths.
+Batch mode: `tg bots create-batch path/to.csv [--only N]` expects columns like `botfather_newbot_name`, `botfather_username`, `botpic_path`, `botfather_about_text`, `botfather_description`, `order`, `bundle_slug`. Missing photo paths are resolved relative to the current working directory when possible.
 
 ### Unread / inbox
 
@@ -258,7 +258,7 @@ If secrets are ever committed, rotate Telegram app credentials / bot tokens imme
 
 Treat a leaked **user session file** as a full account compromise: revoke other sessions from Telegram Settings → Devices, delete local session, re-login.
 
-Public repo policy: agent batch folders (`first-10-*`), persona bibles, and marketplace private assets are **gitignored** by default. Keep them local or in a private store.
+Public repo policy: agent batch folders, persona bibles, and marketplace private assets are **gitignored** by default. Keep them local or in a private store. Do not put real bot usernames, tokens, or account identifiers in docs or examples.
 
 ## Testing strategy
 
