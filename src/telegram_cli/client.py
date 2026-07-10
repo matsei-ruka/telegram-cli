@@ -27,4 +27,5 @@ async def authed_client(session: str | None = None) -> AsyncIterator[TelegramCli
             )
         yield client
     finally:
-        await client.disconnect()
+        if client.is_connected():
+            await client.disconnect()

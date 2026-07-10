@@ -4,11 +4,12 @@ import asyncio
 import json
 import re
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 import typer
 from rich.table import Table
 from telethon import functions, types
+from telethon.errors import RPCError
 from telethon.tl.custom import Message
 from telethon.utils import get_display_name
 
@@ -24,6 +25,15 @@ from telegram_cli.botfather import (
 from telegram_cli.client import authed_client, build_client
 from telegram_cli.config import BOTS_DIR, DOWNLOAD_DIR, SESSION_PATH, api_credentials
 from telegram_cli.format import console, peer_label, print_dialogs, print_messages
+from telegram_cli.peers import (
+    first_message,
+    invite_hash_from_link,
+    is_usable_message,
+    parse_mode_arg,
+    parse_msg_ids,
+    resolve_peer,
+    same_entity,
+)
 
 app = typer.Typer(
     name="tg",
@@ -49,10 +59,6 @@ app.add_typer(profile_app, name="profile")
 
 def _run(coro):
     return asyncio.run(coro)
-
-
-def _parse_ids(ids: str) -> list[int]:
-    return [int(x.strip()) for x in re.split(r"[\s,]+", ids) if x.strip()]
 
 
 # ── meta ────────────────────────────────────────────────────────────────────
@@ -87,50 +93,54 @@ def login(
     """Interactive login (phone + code + optional 2FA)."""
 
     async def _login() -> None:
-        api_id, api_hash = api_credentials()
         client = build_client()
         await client.connect()
-        if await client.is_user_authorized():
-            me = await client.get_me()
-            console.print(
-                f"[green]Already logged in[/] as {peer_label(me)}"
-            )
-            await client.disconnect()
-            return
-
-        ph = phone or typer.prompt("Phone (+39… / +44…)")
-        await client.send_code_request(ph)
-        code = typer.prompt("Code from Telegram")
         try:
-            await client.sign_in(phone=ph, code=code)
-        except Exception as e:
-            if type(e).__name__ == "SessionPasswordNeededError":
+            if await client.is_user_authorized():
+                me = await client.get_me()
+                console.print(f"[green]Already logged in[/] as {peer_label(me)}")
+                return
+
+            ph = phone or typer.prompt("Phone (+39… / +44…)")
+            await client.send_code_request(ph)
+            code = typer.prompt("Code from Telegram")
+            try:
+                from telethon.errors import SessionPasswordNeededError
+
+                await client.sign_in(phone=ph, code=code)
+            except SessionPasswordNeededError:
                 pw = typer.prompt("2FA password", hide_input=True)
                 await client.sign_in(password=pw)
-            else:
-                raise
-        me = await client.get_me()
-        console.print(f"[green]Login OK[/] {peer_label(me)}")
-        console.print(f"Session: {SESSION_PATH}.session")
-        await client.disconnect()
+
+            me = await client.get_me()
+            console.print(f"[green]Login OK[/] {peer_label(me)}")
+            console.print(f"Session: {SESSION_PATH}.session")
+        finally:
+            if client.is_connected():
+                await client.disconnect()
 
     _run(_login())
 
 
 @app.command("logout")
 def logout(
-    force: Annotated[bool, typer.Option("--force", help="Delete local session only")] = False,
+    force: Annotated[
+        bool, typer.Option("--force", help="Delete local session only (no server logout)")
+    ] = False,
 ) -> None:
     """Log out and remove local session."""
 
     async def _logout() -> None:
         client = build_client()
         await client.connect()
-        if await client.is_user_authorized() and not force:
-            await client.log_out()
-            console.print("[green]Logged out from Telegram[/]")
-        else:
-            await client.disconnect()
+        try:
+            if await client.is_user_authorized() and not force:
+                await client.log_out()
+                console.print("[green]Logged out from Telegram[/]")
+        finally:
+            if client.is_connected():
+                await client.disconnect()
+
         for p in (
             Path(f"{SESSION_PATH}.session"),
             Path(f"{SESSION_PATH}.session-journal"),
@@ -170,19 +180,24 @@ def status() -> None:
             api_id, _ = api_credentials()
             creds = f"api_id={api_id}"
         except SystemExit as e:
-            console.print(f"[red]creds:[/] {e}")
+            msg = e.args[0] if e.args else str(e)
+            console.print(f"[red]creds:[/] {msg}")
             return
+
         client = build_client()
         await client.connect()
-        auth = await client.is_user_authorized()
-        console.print(f"connected: {client.is_connected()}")
-        console.print(f"authorized: {auth}")
-        console.print(f"credentials: {creds}")
-        console.print(f"session: {SESSION_PATH}.session")
-        if auth:
-            me = await client.get_me()
-            console.print(f"user: {peer_label(me)}")
-        await client.disconnect()
+        try:
+            auth = await client.is_user_authorized()
+            console.print(f"connected: {client.is_connected()}")
+            console.print(f"authorized: {auth}")
+            console.print(f"credentials: {creds}")
+            console.print(f"session: {SESSION_PATH}.session")
+            if auth:
+                me = await client.get_me()
+                console.print(f"user: {peer_label(me)}")
+        finally:
+            if client.is_connected():
+                await client.disconnect()
 
     _run(_status())
 
@@ -198,12 +213,17 @@ def resolve(
 
     async def _resolve() -> None:
         async with authed_client() as client:
-            entity = await client.get_entity(peer)
+            entity = await resolve_peer(client, peer)
             console.print(peer_label(entity))
             console.print(f"  type: {type(entity).__name__}")
             if isinstance(entity, types.User):
+                console.print(
+                    f"  username: @{entity.username}" if entity.username else "  username: —"
+                )
                 console.print(f"  bot: {entity.bot}")
-                console.print(f"  bot_can_edit: {getattr(entity, 'bot_can_edit', False)}")
+                console.print(
+                    f"  bot_can_edit: {getattr(entity, 'bot_can_edit', False)}"
+                )
 
     _run(_resolve())
 
@@ -222,7 +242,8 @@ def chat_list(
     async def _list() -> None:
         async with authed_client() as client:
             rows = []
-            async for dlg in client.iter_dialogs(limit=limit * 2 if unread else limit):
+            scan = max(limit * 3, limit) if unread else limit
+            async for dlg in client.iter_dialogs(limit=scan):
                 if unread and not dlg.unread_count:
                     continue
                 rows.append((dlg, dlg.entity, dlg.message))
@@ -256,32 +277,36 @@ def msg_unread(
         typer.Option("--peer", "-p", help="Only this chat (if it has unread)"),
     ] = None,
 ) -> None:
-    """Show new/unread messages (inbox).
+    """Show unread messages (inbox).
 
-    Without --peer: scans dialogs with unread_count > 0 and prints those messages.
-    With --peer: shows unread history for that chat only.
+    Uses each dialog's read_inbox_max_id so only messages newer than the
+    last-read marker are shown (not merely the last N messages).
     """
 
     async def _unread() -> None:
         async with authed_client() as client:
-            targets: list[tuple] = []  # (entity, unread_count)
+            # (entity, unread_count, read_inbox_max_id)
+            targets: list[tuple[Any, int, int]] = []
 
             if peer:
-                entity = await client.get_entity(peer)
+                entity = await resolve_peer(client, peer)
                 count = 0
-                async for dlg in client.iter_dialogs(limit=300):
-                    if dlg.entity.id == entity.id:
+                read_max = 0
+                async for dlg in client.iter_dialogs(limit=500):
+                    if same_entity(dlg.entity, entity):
                         count = dlg.unread_count or 0
+                        read_max = getattr(dlg.dialog, "read_inbox_max_id", 0) or 0
                         break
                 if count == 0:
                     console.print(f"[dim]No unread in[/] {peer_label(entity)}")
                     return
-                targets.append((entity, count))
+                targets.append((entity, count, read_max))
             else:
-                async for dlg in client.iter_dialogs(limit=200):
+                async for dlg in client.iter_dialogs(limit=300):
                     if not dlg.unread_count:
                         continue
-                    targets.append((dlg.entity, dlg.unread_count))
+                    read_max = getattr(dlg.dialog, "read_inbox_max_id", 0) or 0
+                    targets.append((dlg.entity, dlg.unread_count, read_max))
                     if len(targets) >= limit_chats:
                         break
 
@@ -289,23 +314,28 @@ def msg_unread(
                 console.print("[dim]No unread messages[/]")
                 return
 
-            # Summary table
             summary = Table(title="Unread chats")
             summary.add_column("#", style="dim", justify="right")
             summary.add_column("Unread", justify="right", style="yellow")
             summary.add_column("Peer")
-            for i, (ent, count) in enumerate(targets, 1):
+            for i, (ent, count, _) in enumerate(targets, 1):
                 summary.add_row(str(i), str(count), peer_label(ent))
             console.print(summary)
 
             if per_chat <= 0:
                 return
 
-            for ent, count in targets:
+            for ent, count, read_max in targets:
                 n = min(count, per_chat) if count > 0 else per_chat
-                msgs = await client.get_messages(ent, limit=n)
+                # Messages with id > read_inbox_max_id are the unread set
+                msgs = await client.get_messages(ent, min_id=read_max, limit=n)
+                usable = [m for m in msgs if is_usable_message(m)]
                 console.print()
-                print_messages(list(msgs), f"{peer_label(ent)} · {count} unread")
+                await print_messages(
+                    usable,
+                    f"{peer_label(ent)} · {count} unread",
+                    client=client,
+                )
                 if mark_read:
                     await client.send_read_acknowledge(ent)
                     console.print(f"[green]marked read[/] {peer_label(ent)}")
@@ -321,29 +351,52 @@ def chat_info(
 
     async def _info() -> None:
         async with authed_client() as client:
-            entity = await client.get_entity(peer)
+            entity = await resolve_peer(client, peer)
             console.print(f"[bold]{peer_label(entity)}[/]")
             console.print(f"  type: {type(entity).__name__}")
             if isinstance(entity, types.User):
-                console.print(f"  username: @{entity.username}" if entity.username else "  username: —")
+                console.print(
+                    f"  username: @{entity.username}"
+                    if entity.username
+                    else "  username: —"
+                )
                 console.print(f"  bot: {entity.bot}")
                 console.print(f"  verified: {entity.verified}")
                 console.print(f"  phone: {entity.phone or '—'}")
             else:
                 console.print(f"  title: {getattr(entity, 'title', None)}")
-                console.print(f"  username: @{getattr(entity, 'username', None) or '—'}")
+                un = getattr(entity, "username", None)
+                console.print(f"  username: @{un}" if un else "  username: —")
                 console.print(f"  megagroup: {getattr(entity, 'megagroup', False)}")
                 console.print(f"  broadcast: {getattr(entity, 'broadcast', False)}")
+                # Full channel/chat for participant count
                 try:
-                    full = await client.get_entity(entity)  # already have
-                    participants = getattr(entity, "participants_count", None)
-                    if participants:
-                        console.print(f"  participants: {participants}")
-                except Exception:
-                    pass
-            # unread
-            async for dlg in client.iter_dialogs(limit=200):
-                if dlg.entity.id == entity.id:
+                    if isinstance(entity, types.Channel):
+                        full = await client(
+                            functions.channels.GetFullChannelRequest(entity)
+                        )
+                        console.print(
+                            f"  participants: {full.full_chat.participants_count}"
+                        )
+                        about = getattr(full.full_chat, "about", None)
+                        if about:
+                            console.print(f"  about: {about}")
+                    elif isinstance(entity, types.Chat):
+                        full = await client(
+                            functions.messages.GetFullChatRequest(entity.id)
+                        )
+                        participants = getattr(
+                            full.full_chat, "participants", None
+                        )
+                        if participants and getattr(participants, "participants", None):
+                            console.print(
+                                f"  participants: {len(participants.participants)}"
+                            )
+                except RPCError as e:
+                    console.print(f"  [dim]full info unavailable: {e.__class__.__name__}[/]")
+
+            async for dlg in client.iter_dialogs(limit=500):
+                if same_entity(dlg.entity, entity):
                     console.print(f"  unread: {dlg.unread_count}")
                     break
 
@@ -358,7 +411,7 @@ def chat_read(
 
     async def _read() -> None:
         async with authed_client() as client:
-            entity = await client.get_entity(peer)
+            entity = await resolve_peer(client, peer)
             await client.send_read_acknowledge(entity)
             console.print(f"[green]Marked read[/] {peer_label(entity)}")
 
@@ -367,27 +420,32 @@ def chat_read(
 
 @chat_app.command("join")
 def chat_join(
-    link: Annotated[str, typer.Argument(help="t.me link, @username, or invite hash")],
+    link: Annotated[str, typer.Argument(help="t.me link, @username, or +invite hash")],
 ) -> None:
     """Join a public channel/group or private invite."""
 
     async def _join() -> None:
         async with authed_client() as client:
             s = link.strip()
-            if "joinchat/" in s or "+" in s or s.startswith("https://t.me/+"):
-                # private invite
-                from telethon.tl.functions.messages import ImportChatInviteRequest
-                from telethon.utils import parse_username
+            inv = invite_hash_from_link(s)
+            if inv:
+                result = await client(
+                    functions.messages.ImportChatInviteRequest(inv)
+                )
+                console.print(f"[green]Joined[/] invite {inv[:8]}…")
+                chats = getattr(result, "chats", None) or []
+                if chats:
+                    console.print(peer_label(chats[0]))
+                return
 
-                hash_ = s.rstrip("/").split("+")[-1].split("joinchat/")[-1]
-                result = await client(ImportChatInviteRequest(hash_))
-                console.print(f"[green]Joined[/] invite {hash_[:8]}…")
-                if getattr(result, "chats", None):
-                    console.print(peer_label(result.chats[0]))
-            else:
-                entity = await client.get_entity(s)
-                await client(functions.channels.JoinChannelRequest(entity))
-                console.print(f"[green]Joined[/] {peer_label(entity)}")
+            entity = await resolve_peer(client, s)
+            if not isinstance(entity, types.Channel):
+                raise SystemExit(
+                    f"Not a public channel/supergroup: {peer_label(entity)}. "
+                    "For private invites use t.me/+HASH or t.me/joinchat/HASH."
+                )
+            await client(functions.channels.JoinChannelRequest(entity))
+            console.print(f"[green]Joined[/] {peer_label(entity)}")
 
     _run(_join())
 
@@ -396,15 +454,52 @@ def chat_join(
 def chat_leave(
     peer: Annotated[str, typer.Argument()],
 ) -> None:
-    """Leave a group or channel."""
+    """Leave a group or channel (does not delete private chat history)."""
 
     async def _leave() -> None:
         async with authed_client() as client:
-            entity = await client.get_entity(peer)
-            await client.delete_dialog(entity)
-            console.print(f"[green]Left/deleted dialog[/] {peer_label(entity)}")
+            entity = await resolve_peer(client, peer)
+            if isinstance(entity, types.Channel):
+                await client(functions.channels.LeaveChannelRequest(entity))
+                console.print(f"[green]Left channel/supergroup[/] {peer_label(entity)}")
+            elif isinstance(entity, types.Chat):
+                me = await client.get_me()
+                await client(
+                    functions.messages.DeleteChatUserRequest(
+                        chat_id=entity.id,
+                        user_id=me,
+                    )
+                )
+                console.print(f"[green]Left group[/] {peer_label(entity)}")
+            else:
+                raise SystemExit(
+                    f"{peer_label(entity)} is not a group/channel.\n"
+                    "For private chats use:  tg chat delete-dialog <peer>"
+                )
 
     _run(_leave())
+
+
+@chat_app.command("delete-dialog")
+def chat_delete_dialog(
+    peer: Annotated[str, typer.Argument()],
+    revoke: Annotated[
+        bool,
+        typer.Option(
+            "--revoke/--no-revoke",
+            help="Also try to delete history for the other side when possible",
+        ),
+    ] = False,
+) -> None:
+    """Delete a dialog (removes chat from your list; for DMs may wipe history)."""
+
+    async def _dd() -> None:
+        async with authed_client() as client:
+            entity = await resolve_peer(client, peer)
+            await client.delete_dialog(entity, revoke=revoke)
+            console.print(f"[green]Deleted dialog[/] {peer_label(entity)}")
+
+    _run(_dd())
 
 
 @chat_app.command("create-group")
@@ -413,18 +508,51 @@ def chat_create_group(
     users: Annotated[
         str, typer.Option("--users", "-u", help="Comma-separated @users or ids")
     ],
+    megagroup: Annotated[
+        bool,
+        typer.Option(
+            "--megagroup",
+            help="Create a supergroup instead of a legacy basic group (recommended)",
+        ),
+    ] = True,
 ) -> None:
-    """Create a basic group."""
+    """Create a group. Default is a supergroup (megagroup); use --no-megagroup for basic."""
 
     async def _cg() -> None:
         async with authed_client() as client:
             peers = [u.strip() for u in users.split(",") if u.strip()]
-            entities = [await client.get_entity(p) for p in peers]
-            result = await client(
-                functions.messages.CreateChatRequest(users=entities, title=title)
-            )
-            chat = result.chats[0] if result.chats else None
-            console.print(f"[green]Created group[/] {peer_label(chat) if chat else title}")
+            if not peers:
+                raise typer.BadParameter("Provide at least one user in --users")
+            entities = [await resolve_peer(client, p) for p in peers]
+            if megagroup:
+                result = await client(
+                    functions.channels.CreateChannelRequest(
+                        title=title,
+                        about="",
+                        megagroup=True,
+                        broadcast=False,
+                    )
+                )
+                chat = result.chats[0]
+                for ent in entities:
+                    try:
+                        await client(
+                            functions.channels.InviteToChannelRequest(chat, [ent])
+                        )
+                    except RPCError as e:
+                        console.print(
+                            f"[yellow]invite failed[/] {peer_label(ent)}: {e.__class__.__name__}"
+                        )
+                console.print(f"[green]Created supergroup[/] {peer_label(chat)}")
+            else:
+                result = await client(
+                    functions.messages.CreateChatRequest(users=entities, title=title)
+                )
+                chats = getattr(result, "chats", None) or []
+                chat = chats[0] if chats else None
+                console.print(
+                    f"[green]Created basic group[/] {peer_label(chat) if chat else title}"
+                )
 
     _run(_cg())
 
@@ -463,19 +591,17 @@ def chat_mute(
     """Mute notifications for a chat."""
 
     async def _mute() -> None:
-        from datetime import timedelta
+        from time import time as now
 
         async with authed_client() as client:
-            entity = await client.get_entity(peer)
-            if hours <= 0:
-                mute_until = 2**31 - 1
-            else:
-                from time import time
-
-                mute_until = int(time()) + hours * 3600
+            entity = await resolve_peer(client, peer)
+            mute_until = (2**31 - 1) if hours <= 0 else int(now()) + hours * 3600
+            notify_peer = types.InputNotifyPeer(
+                peer=await client.get_input_entity(entity)
+            )
             await client(
                 functions.account.UpdateNotifySettingsRequest(
-                    peer=entity,
+                    peer=notify_peer,
                     settings=types.InputPeerNotifySettings(mute_until=mute_until),
                 )
             )
@@ -502,20 +628,22 @@ def msg_send(
     silent: Annotated[bool, typer.Option("--silent")] = False,
     parse: Annotated[
         Optional[str],
-        typer.Option("--parse", help="md | html | none"),
-    ] = "md",
+        typer.Option("--parse", help="none | md | html (default: none)"),
+    ] = "none",
 ) -> None:
     """Send a text message and/or file."""
 
     async def _send() -> None:
-        body = text or caption or ""
+        body = text if text is not None else (caption or "")
         if not body and not file:
             raise typer.BadParameter("Provide text and/or --file")
-        parse_mode = None if parse in (None, "none") else parse
+        if file is not None and not file.is_file():
+            raise typer.BadParameter(f"File not found: {file}")
+        parse_mode = parse_mode_arg(parse)
         async with authed_client() as client:
-            entity = await client.get_entity(peer)
+            entity = await resolve_peer(client, peer)
             if file:
-                msg = await client.send_file(
+                result = await client.send_file(
                     entity,
                     file=str(file),
                     caption=body or None,
@@ -524,16 +652,16 @@ def msg_send(
                     parse_mode=parse_mode,
                 )
             else:
-                msg = await client.send_message(
+                result = await client.send_message(
                     entity,
                     body,
                     reply_to=reply_to,
                     silent=silent,
                     parse_mode=parse_mode,
                 )
-            console.print(
-                f"[green]Sent[/] id={msg.id} → {peer_label(entity)}"
-            )
+            msg = first_message(result)
+            mid = getattr(msg, "id", "?")
+            console.print(f"[green]Sent[/] id={mid} → {peer_label(entity)}")
 
     _run(_send())
 
@@ -552,11 +680,11 @@ def msg_history(
 
     async def _hist() -> None:
         async with authed_client() as client:
-            entity = await client.get_entity(peer)
+            entity = await resolve_peer(client, peer)
             msgs = await client.get_messages(
                 entity, limit=limit, search=search, reverse=reverse
             )
-            print_messages(list(msgs), peer_label(entity))
+            await print_messages(list(msgs), peer_label(entity), client=client)
 
     _run(_hist())
 
@@ -571,9 +699,10 @@ def msg_reply(
 
     async def _reply() -> None:
         async with authed_client() as client:
-            entity = await client.get_entity(peer)
-            msg = await client.send_message(entity, text, reply_to=msg_id)
-            console.print(f"[green]Replied[/] id={msg.id}")
+            entity = await resolve_peer(client, peer)
+            result = await client.send_message(entity, text, reply_to=msg_id)
+            msg = first_message(result)
+            console.print(f"[green]Replied[/] id={getattr(msg, 'id', '?')}")
 
     _run(_reply())
 
@@ -588,9 +717,9 @@ def msg_forward(
 
     async def _fwd() -> None:
         async with authed_client() as client:
-            s = await client.get_entity(src)
-            d = await client.get_entity(dest)
-            result = await client.forward_messages(d, _parse_ids(ids), s)
+            s = await resolve_peer(client, src)
+            d = await resolve_peer(client, dest)
+            result = await client.forward_messages(d, parse_msg_ids(ids), s)
             n = len(result) if isinstance(result, list) else 1
             console.print(f"[green]Forwarded[/] {n} message(s)")
 
@@ -607,7 +736,7 @@ def msg_edit(
 
     async def _edit() -> None:
         async with authed_client() as client:
-            entity = await client.get_entity(peer)
+            entity = await resolve_peer(client, peer)
             await client.edit_message(entity, msg_id, text)
             console.print(f"[green]Edited[/] {msg_id}")
 
@@ -627,9 +756,10 @@ def msg_delete(
 
     async def _del() -> None:
         async with authed_client() as client:
-            entity = await client.get_entity(peer)
-            await client.delete_messages(entity, _parse_ids(ids), revoke=revoke)
-            console.print(f"[green]Deleted[/] {ids}")
+            entity = await resolve_peer(client, peer)
+            mid = parse_msg_ids(ids)
+            await client.delete_messages(entity, mid, revoke=revoke)
+            console.print(f"[green]Deleted[/] {','.join(map(str, mid))}")
 
     _run(_del())
 
@@ -647,40 +777,55 @@ def msg_search(
 
     async def _search() -> None:
         async with authed_client() as client:
-            entity = await client.get_entity(peer) if peer else None
-            if entity:
+            if peer:
+                entity = await resolve_peer(client, peer)
                 msgs = await client.get_messages(entity, limit=limit, search=query)
-                print_messages(list(msgs), peer_label(entity))
-            else:
-                results = await client(
-                    functions.messages.SearchGlobalRequest(
-                        q=query,
-                        filter=types.InputMessagesFilterEmpty(),
-                        min_date=None,
-                        max_date=None,
-                        offset_rate=0,
-                        offset_peer=types.InputPeerEmpty(),
-                        offset_id=0,
-                        limit=limit,
-                    )
-                )
-                msgs = [m for m in results.messages if isinstance(m, types.Message)]
-                # attach senders poorly — still print
-                table = Table(title=f"Search: {query}")
-                table.add_column("ID")
-                table.add_column("Date")
-                table.add_column("Peer")
-                table.add_column("Text")
-                from telegram_cli.format import fmt_dt, msg_preview
+                await print_messages(list(msgs), peer_label(entity), client=client)
+                return
 
-                for m in msgs:
-                    table.add_row(
-                        str(m.id),
-                        fmt_dt(m.date),
-                        str(m.peer_id),
-                        msg_preview(m, 80),
-                    )
-                console.print(table)
+            results = await client(
+                functions.messages.SearchGlobalRequest(
+                    q=query,
+                    filter=types.InputMessagesFilterEmpty(),
+                    min_date=None,
+                    max_date=None,
+                    offset_rate=0,
+                    offset_peer=types.InputPeerEmpty(),
+                    offset_id=0,
+                    limit=limit,
+                )
+            )
+            table = Table(title=f"Search: {query}")
+            table.add_column("ID")
+            table.add_column("Date")
+            table.add_column("Peer")
+            table.add_column("Text")
+            from telegram_cli.format import fmt_dt, msg_preview
+
+            # Index chats/users from result for labels
+            entities: dict[int, Any] = {}
+            for u in getattr(results, "users", []) or []:
+                entities[u.id] = u
+            for c in getattr(results, "chats", []) or []:
+                entities[c.id] = c
+
+            for m in results.messages:
+                if not isinstance(m, types.Message):
+                    continue
+                peer_obj = getattr(m, "peer_id", None)
+                label = str(peer_obj)
+                try:
+                    # resolve from bundled entities when possible
+                    if isinstance(peer_obj, types.PeerUser) and peer_obj.user_id in entities:
+                        label = peer_label(entities[peer_obj.user_id])
+                    elif isinstance(peer_obj, types.PeerChannel) and peer_obj.channel_id in entities:
+                        label = peer_label(entities[peer_obj.channel_id])
+                    elif isinstance(peer_obj, types.PeerChat) and peer_obj.chat_id in entities:
+                        label = peer_label(entities[peer_obj.chat_id])
+                except Exception:
+                    pass
+                table.add_row(str(m.id), fmt_dt(m.date), label, msg_preview(m, 80))
+            console.print(table)
 
     _run(_search())
 
@@ -695,7 +840,7 @@ def msg_pin(
 
     async def _pin() -> None:
         async with authed_client() as client:
-            entity = await client.get_entity(peer)
+            entity = await resolve_peer(client, peer)
             await client.pin_message(entity, msg_id, notify=not silent)
             console.print(f"[green]Pinned[/] {msg_id}")
 
@@ -712,14 +857,23 @@ def msg_react(
 
     async def _react() -> None:
         async with authed_client() as client:
-            entity = await client.get_entity(peer)
-            await client(
-                functions.messages.SendReactionRequest(
-                    peer=entity,
-                    msg_id=msg_id,
-                    reaction=[types.ReactionEmoji(emoticon=emoji)],
+            entity = await resolve_peer(client, peer)
+            try:
+                await client(
+                    functions.messages.SendReactionRequest(
+                        peer=entity,
+                        msg_id=msg_id,
+                        reaction=[types.ReactionEmoji(emoticon=emoji)],
+                    )
                 )
-            )
+            except RPCError as e:
+                name = e.__class__.__name__
+                if "Premium" in name:
+                    raise SystemExit(
+                        "Reactions failed: Telegram Premium required on this account "
+                        f"({name})."
+                    ) from e
+                raise SystemExit(f"Reaction failed: {name}: {e}") from e
             console.print(f"[green]Reacted[/] {emoji} on {msg_id}")
 
     _run(_react())
@@ -735,12 +889,17 @@ def msg_get(
 
     async def _get() -> None:
         async with authed_client() as client:
-            entity = await client.get_entity(peer)
+            entity = await resolve_peer(client, peer)
             msgs = await client.get_messages(entity, ids=msg_id)
-            m: Message | None = msgs if not isinstance(msgs, list) else (msgs[0] if msgs else None)
-            if not m:
+            m: Message | None
+            if isinstance(msgs, list):
+                m = msgs[0] if msgs else None
+            else:
+                m = msgs
+            if not is_usable_message(m):
                 console.print("[red]Message not found[/]")
                 raise typer.Exit(1)
+            assert m is not None
             if json_out:
                 console.print_json(
                     json.dumps(
@@ -754,7 +913,7 @@ def msg_get(
                     )
                 )
             else:
-                print_messages([m], peer_label(entity))
+                await print_messages([m], peer_label(entity), client=client)
                 if m.message:
                     console.print(m.message)
 
@@ -775,7 +934,7 @@ def msg_listen(
         from telethon import events
 
         async with authed_client() as client:
-            entity = await client.get_entity(peer) if peer else None
+            entity = await resolve_peer(client, peer) if peer else None
             console.print("[dim]Listening… Ctrl+C to stop[/]")
 
             @client.on(events.NewMessage(chats=entity))
@@ -789,7 +948,10 @@ def msg_listen(
                     f"{(event.message.message or '[media]')[:200]}"
                 )
 
-            await client.run_until_disconnected()
+            try:
+                await client.run_until_disconnected()
+            except asyncio.CancelledError:
+                pass
 
     try:
         _run(_listen())
@@ -816,15 +978,18 @@ def media_upload(
         if not path.is_file():
             raise typer.BadParameter(f"File not found: {path}")
         async with authed_client() as client:
-            entity = await client.get_entity(peer)
-            msg = await client.send_file(
+            entity = await resolve_peer(client, peer)
+            result = await client.send_file(
                 entity,
                 file=str(path),
                 caption=caption,
                 force_document=force_document,
                 voice_note=voice,
             )
-            console.print(f"[green]Uploaded[/] msg_id={msg.id} → {peer_label(entity)}")
+            msg = first_message(result)
+            console.print(
+                f"[green]Uploaded[/] msg_id={getattr(msg, 'id', '?')} → {peer_label(entity)}"
+            )
 
     _run(_up())
 
@@ -842,9 +1007,11 @@ def media_download(
 
     async def _dl() -> None:
         async with authed_client() as client:
-            entity = await client.get_entity(peer)
+            entity = await resolve_peer(client, peer)
             msg = await client.get_messages(entity, ids=msg_id)
-            if not msg or not msg.media:
+            if isinstance(msg, list):
+                msg = msg[0] if msg else None
+            if not is_usable_message(msg) or not getattr(msg, "media", None):
                 console.print("[red]No media on that message[/]")
                 raise typer.Exit(1)
             DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -865,8 +1032,10 @@ def media_download_chat(
 
     async def _dlc() -> None:
         async with authed_client() as client:
-            entity = await client.get_entity(peer)
-            dest = out or (DOWNLOAD_DIR / str(getattr(entity, "username", None) or entity.id))
+            entity = await resolve_peer(client, peer)
+            dest = out or (
+                DOWNLOAD_DIR / str(getattr(entity, "username", None) or entity.id)
+            )
             dest.mkdir(parents=True, exist_ok=True)
             n = 0
             async for msg in client.iter_messages(entity, limit=limit):
@@ -922,7 +1091,9 @@ def contacts_search(
 
     async def _cs() -> None:
         async with authed_client() as client:
-            result = await client(functions.contacts.SearchRequest(q=query, limit=limit))
+            result = await client(
+                functions.contacts.SearchRequest(q=query, limit=limit)
+            )
             table = Table(title=f"Search users: {query}")
             table.add_column("ID")
             table.add_column("Name")
@@ -948,7 +1119,7 @@ def contacts_block(
 
     async def _block() -> None:
         async with authed_client() as client:
-            entity = await client.get_entity(peer)
+            entity = await resolve_peer(client, peer)
             if unblock:
                 await client(functions.contacts.UnblockRequest(id=entity))
                 console.print(f"[green]Unblocked[/] {peer_label(entity)}")
@@ -968,12 +1139,14 @@ def contacts_add(
     """Add a contact by phone number."""
 
     async def _add() -> None:
+        import random
+
         async with authed_client() as client:
             result = await client(
                 functions.contacts.ImportContactsRequest(
                     contacts=[
                         types.InputPhoneContact(
-                            client_id=0,
+                            client_id=random.randint(1, 2**31 - 1),
                             phone=phone,
                             first_name=first_name,
                             last_name=last_name or "",
@@ -1006,7 +1179,11 @@ def profile_set_name(
 
     async def _sn() -> None:
         async with authed_client() as client:
-            await client(functions.account.UpdateProfileRequest(first_name=first, last_name=last))
+            await client(
+                functions.account.UpdateProfileRequest(
+                    first_name=first, last_name=last
+                )
+            )
             console.print(f"[green]Name set[/] {first} {last}".rstrip())
 
     _run(_sn())
@@ -1033,6 +1210,8 @@ def profile_set_photo(
     """Update your profile photo."""
 
     async def _sp() -> None:
+        if not path.is_file():
+            raise typer.BadParameter(f"File not found: {path}")
         async with authed_client() as client:
             file = await client.upload_file(str(path))
             await client(functions.photos.UploadProfilePhotoRequest(file=file))
@@ -1057,10 +1236,13 @@ def bots_create(
     """Create a bot via @BotFather; optionally set photo/about/description."""
 
     async def _create() -> None:
+        if photo is not None and not photo.is_file():
+            raise typer.BadParameter(f"Photo not found: {photo}")
         async with authed_client() as client:
             info = await create_via_botfather(client, name, username)
             console.print(
-                f"[green]Created[/] {info['username_at']}  token={info['token'][:16]}…"
+                f"[green]Created[/] {info['username_at']}  "
+                f"token={info['token'][:16]}…"
             )
             bot = await resolve_bot(client, info["username"])
             photo_set = False
@@ -1068,7 +1250,7 @@ def bots_create(
                 await set_bot_photo(client, bot, photo)
                 photo_set = True
                 console.print(f"[green]Photo set[/] from {photo}")
-            if about or description or name:
+            if about is not None or description is not None:
                 await set_bot_info(
                     client,
                     bot,
@@ -1077,6 +1259,9 @@ def bots_create(
                     description=description,
                 )
                 console.print("[green]Info set[/]")
+            elif name:
+                # Always sync display name from create args
+                await set_bot_info(client, bot, name=name)
             info["photo_set"] = photo_set
             path = save_bot_credentials(info, str(photo) if photo else None)
             console.print(f"credentials → {path}")
@@ -1094,6 +1279,8 @@ def bots_set_photo(
     """Set a bot profile photo (owner MTProto)."""
 
     async def _sp() -> None:
+        if not photo.is_file():
+            raise typer.BadParameter(f"Photo not found: {photo}")
         async with authed_client() as client:
             entity = await resolve_bot(client, bot)
             result = await set_bot_photo(client, entity, photo)
@@ -1101,7 +1288,6 @@ def bots_set_photo(
                 f"[green]Photo set[/] on @{entity.username} "
                 f"(photo_id={getattr(getattr(result, 'photo', None), 'id', result)})"
             )
-            # update saved creds if any
             cred = BOTS_DIR / f"{entity.username}.json"
             if cred.is_file():
                 data = json.loads(cred.read_text())
@@ -1122,6 +1308,8 @@ def bots_set_info(
     """Set bot name / about / description."""
 
     async def _si() -> None:
+        if name is None and about is None and description is None:
+            raise typer.BadParameter("Provide at least one of --name / --about / --description")
         async with authed_client() as client:
             entity = await resolve_bot(client, bot)
             await set_bot_info(
@@ -1221,7 +1409,9 @@ def bots_father(
 def bots_create_batch(
     csv_path: Annotated[
         Path,
-        typer.Argument(help="CSV with botfather_newbot_name, botfather_username, botpic_path…"),
+        typer.Argument(
+            help="CSV with botfather_newbot_name, botfather_username, botpic_path…"
+        ),
     ],
     only: Annotated[
         Optional[int],
@@ -1234,9 +1424,13 @@ def bots_create_batch(
     import csv
 
     async def _batch() -> None:
+        if not csv_path.is_file():
+            raise typer.BadParameter(f"CSV not found: {csv_path}")
         rows = list(csv.DictReader(csv_path.open(encoding="utf-8")))
         if only is not None:
             rows = [r for r in rows if int(r.get("order") or 0) == only]
+            if not rows:
+                raise SystemExit(f"No CSV row with order={only}")
         async with authed_client() as client:
             for row in rows:
                 name = row.get("botfather_newbot_name") or row.get("persona_name")
@@ -1248,19 +1442,22 @@ def bots_create_batch(
                 if dry_run:
                     console.print("  [dim]dry-run skip[/]")
                     continue
-                # map absolute server paths → local batch folder if needed
                 photo: Path | None = None
                 if photo_raw and not skip_photo:
                     p = Path(photo_raw)
                     if not p.is_file():
-                        # try relative under cwd / first-10*
                         slug = row.get("bundle_slug") or ""
                         for cand in [
-                            Path("first-10-20260709") / slug / "profile_photo" / "selected.jpg",
-                            Path(photo_raw.replace(
-                                "/home/jc/dav/dedalus-prime/agent-batches/",
-                                "",
-                            )),
+                            Path("first-10-20260709")
+                            / slug
+                            / "profile_photo"
+                            / "selected.jpg",
+                            Path(
+                                photo_raw.replace(
+                                    "/home/jc/dav/dedalus-prime/agent-batches/",
+                                    "",
+                                )
+                            ),
                         ]:
                             if cand.is_file():
                                 p = cand
@@ -1295,9 +1492,44 @@ def bots_create_batch(
 # ── raw / advanced ──────────────────────────────────────────────────────────
 
 
+def _resolve_tl_request(method: str) -> Any:
+    """Resolve dotted TL name to a Request class, e.g. help.GetConfig."""
+    parts = method.strip().split(".")
+    if not parts:
+        raise SystemExit("Empty method name")
+    obj: Any = functions
+    for i, p in enumerate(parts):
+        candidates = [p]
+        if not p.endswith("Request"):
+            # GetConfig → GetConfigRequest; getConfig → GetConfigRequest
+            camel = p[0].upper() + p[1:] if p else p
+            candidates.append(camel)
+            candidates.append(camel + "Request")
+            candidates.append(p + "Request")
+        found = None
+        for name in candidates:
+            if hasattr(obj, name):
+                found = getattr(obj, name)
+                break
+        if found is None:
+            # module names are lowercase: messages, help, …
+            if hasattr(obj, p.lower()):
+                found = getattr(obj, p.lower())
+            elif hasattr(obj, p):
+                found = getattr(obj, p)
+        if found is None:
+            available = [x for x in dir(obj) if not x.startswith("_")][:30]
+            raise SystemExit(
+                f"Unknown TL path segment {p!r} in {method!r}. "
+                f"Examples under current node: {available}"
+            )
+        obj = found
+    return obj
+
+
 @app.command("raw")
 def raw_cmd(
-    method: Annotated[str, typer.Argument(help="e.g. messages.GetDialogs")],
+    method: Annotated[str, typer.Argument(help="e.g. help.GetConfig")],
     params: Annotated[
         Optional[str],
         typer.Option("--params", "-p", help="JSON object of kwargs"),
@@ -1307,33 +1539,16 @@ def raw_cmd(
 
     async def _raw() -> None:
         async with authed_client() as client:
-            parts = method.split(".")
-            obj: Any = functions
-            for p in parts:
-                # CamelCase request names
-                name = p if p.endswith("Request") else p[0].upper() + p[1:] + "Request"
-                # try both
-                if hasattr(obj, p):
-                    obj = getattr(obj, p)
-                elif hasattr(obj, name):
-                    obj = getattr(obj, name)
-                else:
-                    # module path like messages
-                    if hasattr(obj, p):
-                        obj = getattr(obj, p)
-                    else:
-                        # try capitalized module
-                        raise SystemExit(f"Unknown method path segment: {p} under {obj}")
+            cls = _resolve_tl_request(method)
+            if not callable(cls):
+                raise SystemExit(f"Not a callable TL request: {cls}")
             kwargs = json.loads(params) if params else {}
-            if callable(obj):
-                # TLRequest class
-                req = obj(**kwargs) if kwargs else obj()
-                result = await client(req)
-            else:
-                raise SystemExit(f"Not callable: {obj}")
+            try:
+                req = cls(**kwargs) if kwargs else cls()
+            except TypeError as e:
+                raise SystemExit(f"Bad params for {method}: {e}") from e
+            result = await client(req)
             console.print(result)
-
-    from typing import Any
 
     _run(_raw())
 

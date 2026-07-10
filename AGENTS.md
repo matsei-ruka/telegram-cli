@@ -105,6 +105,14 @@ tg whoami
 
 `config.py` loads `.env` from the current working directory first, then the project root.
 
+**Data directories** (sessions, bots, downloads) default to **cwd** via `TG_DATA_DIR`, not the package install path — so a non-editable `pip install` does not write under `site-packages`.
+
+Peer arguments that are pure integers are coerced with `peers.normalize_peer` before `get_entity` (Telethon rejects string ids like `"12345"`).
+
+`tg chat leave` only leaves groups/channels. Use `tg chat delete-dialog` to remove private chats from the dialog list.
+
+`tg unread` uses each dialog’s `read_inbox_max_id` so it shows messages newer than the last-read marker (not merely the last N messages).
+
 ## Architecture notes
 
 ### User session vs Bot API
@@ -161,7 +169,7 @@ Batch mode: `tg bots create-batch path/to.csv [--only N]` expects columns like `
 |------|----------|
 | Auth | `login`, `logout`, `whoami`/`me`, `status` |
 | Resolve | `resolve` |
-| Chat | `dialogs`, `chat list|info|read|join|leave|create-group|create-channel|mute` |
+| Chat | `dialogs`, `chat list|info|read|join|leave|delete-dialog|create-group|create-channel|mute` |
 | Messages | `send`, `history`, `search`, `listen`, `unread`, `msg reply|forward|edit|delete|pin|get|react` |
 | Media | `media upload|download|download-chat` |
 | Contacts | `contacts list|search|add|block` |

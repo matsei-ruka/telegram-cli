@@ -72,8 +72,9 @@ tg bots list
 | `tg chat info <peer>` | Chat or user details |
 | `tg chat read <peer>` | Mark chat as read |
 | `tg chat join <link\|@channel>` | Join channel/group or invite |
-| `tg chat leave <peer>` | Leave / delete dialog |
-| `tg chat create-group -t Title -u @a,@b` | Create a basic group |
+| `tg chat leave <peer>` | Leave a group/channel |
+| `tg chat delete-dialog <peer>` | Delete a dialog (DMs / remove from list) |
+| `tg chat create-group -t Title -u @a,@b` | Create a supergroup (default; `--no-megagroup` for basic) |
 | `tg chat create-channel -t Title` | Create a channel (`--megagroup` for supergroup) |
 | `tg chat mute <peer> [--hours N]` | Mute notifications |
 
@@ -143,10 +144,11 @@ Credentials are saved as `bots/<username>.json` and `bots/<username>.env` (gitig
 | `TELEGRAM_API_ID` | — | Required |
 | `TELEGRAM_API_HASH` | — | Required |
 | `TG_API_ID` / `TG_API_HASH` | — | Aliases |
-| `TG_SESSION_DIR` | `./sessions` | Session directory |
+| `TG_DATA_DIR` | cwd | Root for sessions/bots/downloads |
+| `TG_SESSION_DIR` | `$TG_DATA_DIR/sessions` | Session directory |
 | `TG_SESSION_NAME` | `user` | Session file basename |
-| `TG_BOTS_DIR` | `./bots` | Saved bot credentials |
-| `TG_DOWNLOAD_DIR` | `./downloads` | Media downloads |
+| `TG_BOTS_DIR` | `$TG_DATA_DIR/bots` | Saved bot credentials |
+| `TG_DOWNLOAD_DIR` | `$TG_DATA_DIR/downloads` | Media downloads |
 
 ## Examples
 
