@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "telegram-cli"
+version = "0.1.0"
+description = "Full-featured Telegram CLI (user MTProto): messages, media, bots, BotFather"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "telethon>=1.36",
+  "python-dotenv>=1.0",
+  "typer>=0.12",
+  "rich>=13.0",
+]
+
+[project.scripts]
+tg = "telegram_cli.cli:app"
+telegram-cli = "telegram_cli.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/telegram_cli"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/telegram_cli", "README.md", "pyproject.toml"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src/telegram_cli" = "telegram_cli"

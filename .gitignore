@@ -1,0 +1,22 @@
+.venv/
+.env
+*.session
+*.session-journal
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+dist/
+build/
+*.egg-info/
+src/*.egg-info/
+sessions/
+downloads/
+bots/*
+!bots/.gitkeep
+.DS_Store
+
+# Local agent batches / private persona assets (not part of the CLI product)
+first-10-*/
+agent-batches/
+*.session
